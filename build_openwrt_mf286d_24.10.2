@@ -1,0 +1,215 @@
+#!/bin/bash
+set -Eeuo pipefail
+trap 'echo "[X] Errore alla riga $LINENO. Uscita."; exit 1' ERR
+
+# 🔧 CONFIGURAZIONE
+VERSION="24.10.2"
+TARGET="ipq40xx"
+SUBTARGET="generic"
+PROFILE="zte_mf286d"
+
+BASE_URL="https://downloads.openwrt.org"
+ARCHIVE_NAME="openwrt-imagebuilder-${VERSION}-${TARGET}-${SUBTARGET}.Linux-x86_64.tar.zst"
+ARCHIVE_URL="${BASE_URL}/releases/${VERSION}/targets/${TARGET}/${SUBTARGET}/${ARCHIVE_NAME}"
+
+PACKAGES="luci luci-app-modemband luci-app-sms-tool-js luci-app-3ginfo-lite luci-app-atcommands \
+kmod-usb-serial-option kmod-usb-serial kmod-usb-serial-wwan \
+usb-modeswitch kmod-mii kmod-usb-net kmod-usb-wdm \
+kmod-usb-net-qmi-wwan uqmi kmod-usb-net-cdc-mbim \
+luci-proto-qmi modemmanager luci-proto-modemmanager luci-proto-wireguard wireguard-tools"
+
+# 📦 Verifica tool richiesti
+for t in wget tar make unzstd sha256sum; do
+  command -v "$t" >/dev/null || { echo "[!] Tool mancante: $t. Installa con: sudo apt install $t"; exit 1; }
+done
+
+echo "==> OpenWrt ${VERSION} | Target: ${TARGET}/${SUBTARGET} | Profilo: ${PROFILE}"
+echo "==> Scarico ImageBuilder da: $ARCHIVE_URL"
+
+# ✅ Scarico ImageBuilder se non presente
+if [[ -f "$ARCHIVE_NAME" && -s "$ARCHIVE_NAME" ]]; then
+    echo "[✓] File ImageBuilder già presente: $ARCHIVE_NAME"
+else
+    wget --show-progress "$ARCHIVE_URL" -O "$ARCHIVE_NAME"
+fi
+
+# 📦 Estrazione
+tar --use-compress-program=unzstd -xf "$ARCHIVE_NAME"
+
+# 📁 Rileva cartella estratta
+FOLDER_NAME=$(find . -maxdepth 1 -type d -name "openwrt-imagebuilder-${VERSION}-*${TARGET}*${SUBTARGET}*" | head -n1)
+[[ -d "$FOLDER_NAME" ]] || { echo "[X] Cartella ImageBuilder non trovata."; exit 1; }
+echo "[✓] Cartella trovata: $FOLDER_NAME"
+
+# 🔍 Recupero automatico hash kmods per 24.10.2
+KMOD_HASH=$(wget -qO- "${BASE_URL}/releases/${VERSION}/targets/${TARGET}/${SUBTARGET}/kmods/" \
+  | grep -oE '6\.6\.[0-9]+-1-[a-f0-9]{32}' | head -n1)
+
+if [[ -z "$KMOD_HASH" ]]; then
+  echo "[X] Impossibile recuperare il kernel hash. Verifica che la versione esista."
+  exit 1
+fi
+echo "[✓] Kernel modules hash per ImageBuilder: $KMOD_HASH"
+
+# 📄 Sovrascrivo repositories.conf
+REPO_CONF="$FOLDER_NAME/repositories.conf"
+cat > "$REPO_CONF" <<EOF
+src/gz openwrt_core https://downloads.openwrt.org/releases/${VERSION}/targets/${TARGET}/${SUBTARGET}/packages
+src/gz openwrt_base https://downloads.openwrt.org/releases/${VERSION}/packages/arm_cortex-a7_neon-vfpv4/base
+src/gz openwrt_kmods https://downloads.openwrt.org/releases/${VERSION}/targets/${TARGET}/${SUBTARGET}/kmods/${KMOD_HASH}
+src/gz openwrt_luci https://downloads.openwrt.org/releases/${VERSION}/packages/arm_cortex-a7_neon-vfpv4/luci
+src/gz openwrt_packages https://downloads.openwrt.org/releases/${VERSION}/packages/arm_cortex-a7_neon-vfpv4/packages
+src/gz openwrt_routing https://downloads.openwrt.org/releases/${VERSION}/packages/arm_cortex-a7_neon-vfpv4/routing
+src/gz openwrt_telephony https://downloads.openwrt.org/releases/${VERSION}/packages/arm_cortex-a7_neon-vfpv4/telephony
+src imagebuilder file:packages
+option check_signature
+EOF
+
+# 📦 Verifica pacchetti locali
+echo "==> Verifico pacchetti .ipk in _local_packages/"
+mkdir -p _local_packages
+for base in luci-app-modemband luci-app-sms-tool-js luci-app-3ginfo-lite luci-app-atcommands; do
+  match=$(find _local_packages/ -maxdepth 1 -type f -name "${base}*.ipk" | head -n1)
+  [[ -n "$match" && -s "$match" ]] || { echo "[X] Pacchetto mancante o vuoto: ${base}"; exit 1; }
+done
+
+# 📦 Integro pacchetti in ImageBuilder
+mkdir -p "$FOLDER_NAME/packages"
+cp -f _local_packages/*.ipk "$FOLDER_NAME/packages/"
+grep -qxF 'src custom file:packages' "$REPO_CONF" || echo 'src custom file:packages' >> "$REPO_CONF"
+
+# 📁 Copio file apn-web statici
+echo "==> Copio file apn-web in files/www/"
+WWW_DIR="$FOLDER_NAME/files/www"
+CGI_DIR="$WWW_DIR/cgi-bin"
+mkdir -p "$WWW_DIR" "$CGI_DIR"
+cp -f "_local_packages/apn-web-files/apn.html" "$WWW_DIR/"
+for f in control reboot_router restart_wan set_apn set_apn_modemmanager system_action; do
+  cp -f "_local_packages/apn-web-files/$f" "$CGI_DIR/"
+done
+chmod +x "$CGI_DIR/"*
+
+# 🌐 Configurazione di rete
+mkdir -p "$FOLDER_NAME/files/etc/config"
+cat > "$FOLDER_NAME/files/etc/config/network" << 'EOF'
+config interface 'loopback'
+    option device 'lo'
+    option proto 'static'
+    option ipaddr '127.0.0.1'
+    option netmask '255.0.0.0'
+
+config globals 'globals'
+    option ula_prefix 'fd00:abcd::/48'
+
+config device
+    option name 'br-lan'
+    option type 'bridge'
+    list ports 'lan2'
+    list ports 'lan3'
+    list ports 'lan4'
+
+config interface 'lan'
+    option device 'br-lan'
+    option proto 'static'
+    option ipaddr '192.168.1.1'
+    option netmask '255.255.255.0'
+    option ip6assign '60'
+
+config interface 'wan'
+    option device '/dev/cdc-wdm0'
+    option proto 'qmi'
+    option apn 'internet'
+    option auth 'none'
+    option pdptype 'ipv4'
+    option auto '1'
+
+config interface 'wan6'
+    option device 'wan'
+    option proto 'dhcpv6'
+EOF
+
+# 🔐 Configurazione firewall
+cat > "$FOLDER_NAME/files/etc/config/firewall" << 'EOF'
+config defaults
+    option input 'ACCEPT'
+    option output 'ACCEPT'
+    option forward 'REJECT'
+    option syn_flood '1'
+
+config zone
+    option name 'lan'
+    option network 'lan'
+    option input 'ACCEPT'
+    option output 'ACCEPT'
+    option forward 'ACCEPT'
+
+config zone
+    option name 'wan'
+    option network 'wan wan6'
+    option input 'REJECT'
+    option output 'ACCEPT'
+    option forward 'REJECT'
+    option masq '1'
+    option mtu_fix '1'
+
+config forwarding
+    option src 'lan'
+    option dest 'wan'
+EOF
+
+# 📡 Configurazione Wi-Fi disabilitata
+cat > "$FOLDER_NAME/files/etc/config/wireless" << 'EOF'
+config wifi-device 'radio0'
+    option type 'mac80211'
+    option path 'platform/soc/a000000.wifi'
+    option band '2g'
+    option htmode 'HT20'
+    option channel 'auto'
+    option country 'IT'
+    option cell_density '0'
+    option disabled '0'
+
+config wifi-iface 'default_radio0'
+    option device 'radio0'
+    option mode 'ap'
+    option ssid 'OPENWRT'
+    option encryption 'sae-mixed'
+    option network 'lan'
+    option ieee80211w '1'         
+    option ocv '0'                
+
+config wifi-device 'radio1'
+    option type 'mac80211'
+    option path 'platform/soc/a800000.wifi'
+    option band '5g'
+    option htmode 'VHT40'
+    option channel 'auto'
+    option country 'IT'
+    option cell_density '0'
+    option disabled '0'
+
+config wifi-iface 'default_radio1'
+    option device 'radio1'
+    option mode 'ap'
+    option ssid 'OPENWRT'
+    option encryption 'sae-mixed'
+    option network 'lan'
+    option ieee80211w '1'
+    option ocv '0'
+
+EOF
+
+# 🏗️ Compilazione immagine
+cd "$FOLDER_NAME"
+echo "==> Compilo immagine per ${PROFILE}..."
+make image PROFILE="$PROFILE" FILES=files/ PACKAGES="$PACKAGES"
+
+# 📁 Output immagine
+OUT_DIR="bin/targets/${TARGET}/${SUBTARGET}"
+SYSUPGRADE=$(find "$OUT_DIR" -name '*sysupgrade*.bin' | head -n1)
+[[ -f "$SYSUPGRADE" ]] || { echo "[X] sysupgrade.bin non trovato."; exit 1; }
+
+# 🖥️ Copia su Desktop
+DEST=~/Desktop/sysupgrade-${PROFILE}-$(date +%Y%m%d-%H%M).bin
+cp -f "$SYSUPGRADE" "$DEST"
+echo "[✓] sysupgrade.bin copiato su Scrivania: $DEST"
